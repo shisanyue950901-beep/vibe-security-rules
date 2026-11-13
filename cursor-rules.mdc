@@ -1,0 +1,250 @@
+---
+description: Security rules for Next.js + Supabase + Stripe apps built with AI assistance. Covers Row Level Security, secret handling, storage privacy, paid-API cost caps, webhook signature verification, per-route authorization, and safe error handling.
+globs:
+  - "**/*.ts"
+  - "**/*.tsx"
+  - "**/*.js"
+  - "**/*.jsx"
+  - "**/*.sql"
+alwaysApply: true
+---
+
+# Security Rules — Next.js + Supabase + Stripe
+
+Apply every rule below whenever you write, edit, or review code in this project.
+These rules override convenience. If a faster approach conflicts with a rule, use
+the rule and say so in one short sentence.
+
+## 1. Row Level Security is mandatory, and policies must be scoped to the owner
+
+- Enable RLS on **every** table in the `public` schema, in the same migration
+  that creates the table. A table without RLS is a bug, not a TODO.
+- Write policies that compare the row to the caller, e.g.
+  `auth.uid() = user_id`, or to the caller's tenant via a membership join.
+- Never use `USING (true)` or `WITH CHECK (true)` as a general policy — not
+  "temporarily", not "just for the demo", not for authenticated users either.
+  `TO authenticated USING (true)` still means *every signed-in user can read
+  and write every row*.
+- If a table genuinely holds public read-only data, say which table and why in
+  a code comment, and scope the policy to `SELECT` only.
+
+```sql
+-- BAD: RLS is on, but the policy lets any signed-in user touch all rows
+alter table public.orders enable row level security;
+create policy "orders_all" on public.orders
+  for all to authenticated using (true) with check (true);
+
+-- GOOD: each user sees and modifies only their own orders
+alter table public.orders enable row level security;
+create policy "orders_owner" on public.orders
+  for all to authenticated
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+```
+
+## 2. Server-side secrets never enter client code or `NEXT_PUBLIC_` variables
+
+- The Supabase `service_role` key bypasses RLS entirely. Use it only in
+  server-only code (Route Handlers, Server Actions, Edge Functions, scripts)
+  and read it from a non-public env var: `SUPABASE_SERVICE_ROLE_KEY`.
+- Anything prefixed `NEXT_PUBLIC_` is shipped to every visitor's browser.
+  Never put a service-role key, a database password, an AI provider key, or a
+  Stripe secret key behind `NEXT_PUBLIC_`.
+- Public by design: the Supabase `anon` / publishable key and the Stripe
+  publishable key (`pk_...`). Everything else is secret by default.
+- When you create a Supabase client for the browser, use the anon key. When you
+  need elevated access, do it in a server route that first checks the caller
+  (see rule 6) — never by shipping the service-role key to the client.
+
+```ts
+// BAD: service-role key in a client component — anyone can extract it
+// from the JS bundle and bypass every RLS policy you wrote.
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY! // ← full DB access, public
+);
+
+// GOOD: browser uses the anon key; elevated work happens server-side
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
+```
+
+## 3. Storage buckets are private by default
+
+- Create buckets with `public = false`. Files are then reachable only through
+  signed URLs or storage policies scoped to the owner.
+- Make a bucket public only when the contents are meant to be world-readable
+  (e.g. product images), and write the reason in a comment next to the
+  migration. Never make buckets holding user uploads, invoices, exports, or
+  attachments public.
+- Add storage policies scoped by folder/owner, e.g.
+  `(storage.foldername(name))[1] = auth.uid()::text`.
+
+```sql
+-- BAD: anyone on the internet can list and download every uploaded file
+insert into storage.buckets (id, name, public) values ('uploads', 'uploads', true);
+
+-- GOOD: private bucket, short-lived signed URLs when a file must be shared
+insert into storage.buckets (id, name, public) values ('uploads', 'uploads', false);
+```
+
+## 4. Every route that calls a paid API must be rate-limited and capped
+
+- Any endpoint that calls OpenAI, Anthropic, Replicate, ElevenLabs, or another
+  metered API must have, before it ships:
+  1. authentication (or an explicit, justified exception),
+  2. a per-user / per-IP rate limit,
+  3. a hard cap on per-request size (tokens, characters, seconds, pixels),
+  4. a daily or monthly usage ceiling per user, checked before the call.
+- An unauthenticated, uncapped AI endpoint is an open wallet: anyone can script
+  it and run up the account owner's bill. Treat "we'll add limits later" as a
+  release blocker.
+
+```ts
+// BAD: no auth, no limit, no cap — a loop with curl drains the API credit
+export async function POST(req: Request) {
+  const { prompt } = await req.json();
+  return Response.json(await openai.chat.completions.create({
+    model: "gpt-4o", messages: [{ role: "user", content: prompt }],
+  }));
+}
+
+// GOOD: identified caller, bounded input, usage checked before spending
+export async function POST(req: Request) {
+  const user = await requireUser(req);
+  if (!user) return new Response("Unauthorized", { status: 401 });
+  if (!(await underDailyLimit(user.id))) {
+    return new Response("Daily limit reached", { status: 429 });
+  }
+  const { prompt } = await req.json();
+  if (typeof prompt !== "string" || prompt.length > 4000) {
+    return new Response("Prompt too long", { status: 400 });
+  }
+  // ...call the provider with a max_tokens cap, then record usage
+}
+```
+
+## 5. Webhooks must verify the provider's signature before trusting the body
+
+- For Stripe, always construct the event with the raw request body and the
+  webhook signing secret (`STRIPE_WEBHOOK_SECRET`). If verification throws,
+  return `400` and do nothing else.
+- Never parse `req.json()` and act on fields like `payment_status` directly —
+  anyone can POST a fake "payment succeeded" body to a webhook URL.
+- Apply the same pattern to every provider webhook (signature/HMAC check
+  first, business logic second). Handle each event idempotently: providers
+  retry, so the same event can arrive twice.
+
+```ts
+// BAD: trusts whatever arrives — a forged POST grants a free subscription
+export async function POST(req: Request) {
+  const body = await req.json();
+  if (body.type === "checkout.session.completed") {
+    await grantPremium(body.data.object.metadata.userId);
+  }
+  return new Response("ok");
+}
+
+// GOOD: only Stripe-signed events are processed
+export async function POST(req: Request) {
+  const raw = await req.text();
+  const sig = req.headers.get("stripe-signature")!;
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(raw, sig, process.env.STRIPE_WEBHOOK_SECRET!);
+  } catch {
+    return new Response("Invalid signature", { status: 400 });
+  }
+  if (event.type === "checkout.session.completed") {
+    await grantPremium(event.data.object.metadata.userId);
+  }
+  return new Response("ok");
+}
+```
+
+## 6. Every API route must authenticate the caller and check ownership
+
+- At the top of every Route Handler / Server Action that reads or mutates
+  data: (1) resolve the session server-side, (2) reject anonymous callers
+  unless the route is intentionally public, (3) verify the target resource
+  belongs to the caller before reading, updating, or deleting it.
+- Never trust identity or authority fields sent by the client: `userId`,
+  `role`, `isAdmin`, `price`, `amount`, `tenantId`. Derive identity from the
+  session, role from the database, and price from your own catalog.
+- An `x-admin: true` header, a hidden form field, or a value in localStorage
+  is not an authorization check.
+
+```ts
+// BAD: the client decides who it is and what things cost
+export async function POST(req: Request) {
+  const { userId, price } = await req.json();
+  await charge(userId, price); // attacker sends someone else's id, price: 1
+}
+
+// GOOD: identity from the session, price from the server-side catalog
+export async function POST(req: Request) {
+  const user = await requireUser(req);
+  if (!user) return new Response("Unauthorized", { status: 401 });
+  const { productId } = await req.json();
+  const product = await getProduct(productId); // price lives here, server-side
+  await charge(user.id, product.priceCents);
+}
+```
+
+## 7. Secrets stay out of the repository
+
+- Keep all secrets in `.env.local` (or the platform's env settings). Commit
+  only `.env.example` with placeholder values, never real ones.
+- Ensure `.gitignore` contains `.env*` with the exception `!.env.example`.
+- If a real secret is ever committed, treat it as compromised: rotate it.
+  Deleting the line in a later commit does not help — the value remains in
+  git history.
+- Refer to secrets by env var name in code and docs, never by value.
+
+```gitignore
+# GOOD .gitignore — real env files stay local, the template stays shared
+.env*
+!.env.example
+```
+
+## 8. Errors and logs must not leak secrets or internals
+
+- Return generic messages to clients ("Something went wrong", "Not found",
+  "Unauthorized"). Never return raw exception messages, stack traces, SQL
+  errors, or the text of upstream provider errors — they reveal schema,
+  file paths, and sometimes credentials.
+- Log details server-side with the secrets stripped: never log full request
+  headers (`Authorization`), env vars, tokens, or complete request bodies of
+  auth/payment calls.
+- A resource that exists but belongs to someone else should look like
+  `404 Not Found`, not `403 belongs to user X`.
+
+```ts
+// BAD: ships the database error (and your schema) to the browser
+catch (err) {
+  return Response.json({ error: String(err), stack: err.stack }, { status: 500 });
+}
+
+// GOOD: generic outside, detailed (and redacted) only in server logs
+catch (err) {
+  console.error("order_create_failed", { userId: user.id, code: err.code });
+  return Response.json({ error: "Something went wrong" }, { status: 500 });
+}
+```
+
+## Final self-review before you finish a task
+
+Before saying a change is done, re-scan what you produced and confirm:
+
+1. Every new table has RLS enabled and owner-scoped policies.
+2. No `service_role`, secret key, or password appears in client code or in a
+   `NEXT_PUBLIC_` variable.
+3. New buckets are private unless a comment justifies them being public.
+4. New paid-API routes have auth, a rate limit, an input cap, and a usage cap.
+5. New webhooks verify signatures before any state changes.
+6. Every route resolves the caller server-side and checks resource ownership;
+   no client-sent `userId` / `role` / `price` is trusted.
+7. No real secret values were added to any committed file.
+8. Error responses are generic; logs contain no tokens or auth headers.
