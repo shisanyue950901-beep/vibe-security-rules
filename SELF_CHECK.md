@@ -1,8 +1,9 @@
 # The 10-Minute Pre-Launch Self-Check
 
 For AI-built apps on Supabase / Firebase-style backends. Eight quick tests you
-can run on **your own app**, using only the public `anon` key your frontend
-already ships — no tools to install, nothing to attack. Each test takes about
+can run on **your own app**, using the public `anon` key your frontend
+already ships, a few `grep` searches in your repo, and a quick read of a
+couple of routes — no tools to install, nothing to attack. Each test takes about
 a minute. If any test comes back "bad", fix that one before you take payments.
 
 You only need: your app's URL, your Supabase project URL, and the `anon` key
@@ -26,15 +27,20 @@ curl "https://<project>.supabase.co/rest/v1/orders?select=*" \
   same data.
 - **Fix:** enable RLS on the table and add owner-scoped policies
   (`auth.uid() = user_id`) instead of `USING (true)`.
+- **One blind spot:** this checks anonymous access only. A policy like
+  `TO authenticated USING (true)` still returns `[]` here, yet any signed-in
+  user can read everything. To check authenticated policies too, repeat the
+  call with a logged-in user's JWT (from your browser's devtools) in place
+  of the second `<ANON_KEY>`.
 
 ## 2. Is the service-role key anywhere near the browser?
 
 Search your repo and your built frontend for `service_role`:
 
 ```bash
-grep -r "service_role" --include="*.ts" --include="*.tsx" . 
+grep -rni "service_role" --exclude-dir={node_modules,.next,.git} .
 # and check for it behind NEXT_PUBLIC_ in your env files
-grep -r "NEXT_PUBLIC_.*SERVICE\|NEXT_PUBLIC_.*SECRET\|NEXT_PUBLIC_.*PRIVATE" .
+grep -rnE "NEXT_PUBLIC_.*(SERVICE|SECRET|PRIVATE)" --exclude-dir={node_modules,.next,.git} .
 ```
 
 - ✅ **Good:** the service-role key appears only in server-only code and in a
@@ -48,7 +54,7 @@ grep -r "NEXT_PUBLIC_.*SERVICE\|NEXT_PUBLIC_.*SECRET\|NEXT_PUBLIC_.*PRIVATE" .
 ## 3. Can anyone list your storage buckets?
 
 ```bash
-curl "https://<project>.supabase.co/storage/v1/object/list/<bucket>" \
+curl -X POST "https://<project>.supabase.co/storage/v1/object/list/<bucket>" \
   -H "apikey: <ANON_KEY>" -H "Authorization: Bearer <ANON_KEY>" \
   -H "Content-Type: application/json" -d '{"prefix":""}'
 ```
@@ -59,6 +65,13 @@ curl "https://<project>.supabase.co/storage/v1/object/list/<bucket>" \
   they're downloadable too.
 - **Fix:** set the bucket to private and serve files through signed URLs with
   owner-scoped storage policies.
+- **Watch out:** an empty list does not prove a public bucket is safe.
+  Listing needs a SELECT policy on `storage.objects`, but files in a
+  `public` bucket can still be downloaded by anyone who knows the path
+  (`/storage/v1/object/public/<bucket>/<path>`). Check the bucket itself:
+  `curl "https://<project>.supabase.co/storage/v1/bucket" -H "apikey: <ANON_KEY>" -H "Authorization: Bearer <ANON_KEY>"`
+  — if your bucket shows `"public": true`, treat it as public even when the
+  list call comes back empty.
 
 ## 4. Did any real secret ever land in the repo?
 
@@ -66,7 +79,7 @@ Look for real-format keys in the files that usually get committed by accident
 (`.env.example`, fixtures, docs, example configs):
 
 ```bash
-grep -rE "sk-[A-Za-z0-9_-]{20,}|service_role|STRIPE_SECRET|sk_live_" --include="*.example" --include="*.md" .
+grep -rE "sk-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{20,}|rk_live_[A-Za-z0-9]{20,}|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\." --include="*.example" --include="*.md" .
 ```
 
 - ✅ **Good:** only placeholders like `sk-...` or `your-key-here`.
@@ -96,7 +109,7 @@ grep -rn "x-admin\|isAdmin\|role.*req\.\|req\.json.*userId" app/ src/ 2>/dev/nul
 Log in as user A, open one of A's items (an order, a document), then change
 the ID in the URL or request to one belonging to user B.
 
-- ✅ **Good:** `404` (or `403`) — B's item is invisible to A.
+- ✅ **Good:** `404` (or a bare `403` that reveals nothing) — B's item is invisible to A.
 - ❌ **Bad:** B's data loads. This is the classic broken-access-control hole
   in AI-generated CRUD code.
 - **Fix:** every route must check that the resource's owner matches the
